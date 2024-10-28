@@ -1,0 +1,119 @@
+variables:
+  DOCKER_REPO: "hub.docker.com"
+  PROJECT_NAME: "TodoApp"
+  APP_NAME: "TodoApp141"
+  IMAGE_BASE_NAME: "$DOCKER_REPO/$APP_NAME"
+  IMAGE_NAME: "$DOCKER_REPO/$APP_NAME:$CI_COMMIT_REF_NAME"
+
+stages:
+  - version
+  - build
+  - build_production
+  - deploy
+
+version_job:
+  stage: version
+  tags:
+    - shared-aws
+  script:
+    - bash /home/app/scripts/deploy_version.sh $CI_PROJECT_URL
+  rules:
+    - if: $CI_COMMIT_MESSAGE =~ /#SKIPVERSION/i || $CI_COMMIT_MESSAGE =~ /#SKIPCI/i
+      when: never
+    - if: $CI_COMMIT_REF_NAME == "staging" && $CI_PIPELINE_SOURCE == "merge"
+
+build_image_job:
+  stage: build
+  tags:
+    - shared-aws
+  before_script:
+    - docker --version
+  script:
+    - VERSION=$(git describe --tags --abbrev=0)
+    - echo "NEW VERSION - $VERSION"
+    - echo "IMAGE_NAME $IMAGE_NAME"
+    - docker pull $IMAGE_NAME || true
+    - docker build -f "../Dockerfile" --build-arg VERSION=$VERSION --cache-from $IMAGE_NAME -t $IMAGE_NAME .
+    - docker push $IMAGE_NAME
+    - docker image tag $IMAGE_NAME $IMAGE_BASE_NAME:$VERSION
+    - docker push $IMAGE_BASE_NAME:$VERSION
+  rules:
+    - if: $CI_COMMIT_MESSAGE =~ /#SKIPCI/i
+      when: never
+    - if: $CI_COMMIT_REF_NAME == "staging" && $CI_PIPELINE_SOURCE == "push"
+
+build_prod_image_job:
+  stage: build_production
+  dependencies:
+    - build_image_job
+  tags:
+    - shared-aws
+  before_script:
+    - docker --version
+  script:
+    - VERSION=$(git describe --tags --abbrev=0)
+    - docker pull $IMAGE_BASE_NAME:$VERSION
+    - docker image tag $IMAGE_BASE_NAME:$VERSION $IMAGE_BASE_NAME:production
+    - docker push $IMAGE_BASE_NAME:production
+  rules:
+    - if: $CI_COMMIT_MESSAGE =~ /#SKIPCI/i
+      when: never
+    - if: $CI_COMMIT_REF_NAME == "master" && $CI_PIPELINE_SOURCE == "push"
+
+deploy_job:
+  stage: deploy
+  variables:
+    GIT_SRATEGY: none
+    GIT_CHECKOUT: "false"
+  dependencies:
+    - build_image_job
+    - build_prod_image_job
+  tags:
+    - shared-aws
+  before_script:
+    - docker-compose --version
+    - cd /home/app/scripts
+    - bash deploy-docker-resolve-ip.sh --environment $CI_COMMIT_REF_NAME
+  script:
+    - bash deploy-docker-remote.sh --environment $CI_COMMIT_REF_NAME --appname $APP_NAME
+  environment:
+    name: $CI_COMMIT_REF_NAME
+  rules:
+    - if: $CI_COMMIT_MESSAGE =~ /#SKIPCI/i
+      when: never
+    - if: $CI_COMMIT_REF_NAME == "staging" && $CI_PIPELINE_SOURCE == "push"
+    - if: $CI_COMMIT_REF_NAME == "master" && $CI_PIPELINE_SOURCE == "push"
+
+
+# SAST Configurations
+include:
+  - template: Security/SAST.gitlab-ci.yml
+
+sast:
+  variables:
+    SAST_EXCLUDED_PATHS: "**/wwwroot/lib/*"
+  stage: build
+
+eslint-sast:
+  rules:
+    - if: '$CI_COMMIT_REF_NAME == "dev" && $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_MESSAGE !~ /#SKIPCI/i '
+
+nodejs-scan-sast:
+   rules:
+    - if: '$CI_COMMIT_REF_NAME == "dev" && $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_MESSAGE !~ /#SKIPCI/i '
+
+
+security-code-scan-sast:
+  rules:
+    - if: '$CI_COMMIT_REF_NAME == "dev" && $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_MESSAGE !~ /#SKIPCI/i '
+  before_script:
+  - >
+    dotnet nuget add source
+    $CI_SERVER_URL/$GROUP_CI_PACKAGE_REGISTRY_PATH
+    --name gitlab
+    --username $GROUP_CI_DEPLOY_USER
+    --password $GROUP_CI_DEPLOY_TOKEN
+    --store-password-in-clear-text
+  after_script:
+  - >
+    dotnet nuget remove source gitlab
